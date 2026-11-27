@@ -1,0 +1,18 @@
+[Unit]
+Description=Velluto Interiors website and API
+After=network.target
+
+[Service]
+Type=simple
+User=velluto
+WorkingDirectory=/srv/velluto/app
+EnvironmentFile=/srv/velluto/app/.env
+ExecStart=/usr/bin/node server/dist/index.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

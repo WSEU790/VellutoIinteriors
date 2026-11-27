@@ -1,0 +1,12 @@
+node_modules/
+dist/
+server/dist/
+.env
+.env.*
+!.env.example
+storage/
+*.log
+.DS_Store
+coverage/
+.vscode/*
+!.vscode/extensions.json
