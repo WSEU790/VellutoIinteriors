@@ -1,6 +1,24 @@
 # Deployment (VPS)
 
-Tested target: Ubuntu 22.04/24.04 with Node.js 20+ and Nginx. Any Linux VPS works.
+Target: Ubuntu 22.04/24.04 with Node.js 20+ and Nginx.
+
+## Quick setup (recommended)
+
+`deploy/setup-vps.sh` does everything below in one command: installs Node.js 22, PostgreSQL, Nginx, Certbot and the firewall, clones and builds the site, creates `.env` (with a generated database password and admin token), runs the app under systemd and issues an HTTPS certificate.
+
+1. **Point DNS at the server.** At your domain registrar, create an `A` record for `@` and another for `www`, both pointing to the VPS's IPv4 address.
+2. **Run the script** over SSH:
+
+   ```bash
+   curl -fsSLO https://raw.githubusercontent.com/WSEU790/VellutoIinteriors/main/deploy/setup-vps.sh
+   sudo bash setup-vps.sh --domain your-domain.com --email you@your-domain.com
+   ```
+
+3. **Add your contact details.** Edit `/srv/velluto/app/.env` (`VITE_PUBLIC_PHONE`, `VITE_PUBLIC_EMAIL`, and so on), then re-run the script.
+
+Re-running the script is safe. It pulls the latest code, rebuilds and restarts, and keeps your `.env`, database and HTTPS setup. If DNS isn't pointing at the server yet, the script skips HTTPS and tells you; re-run it once DNS has updated.
+
+The manual steps below show what the script does, for reference or custom setups.
 
 ## 1. Server preparation
 

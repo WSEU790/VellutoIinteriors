@@ -72,6 +72,6 @@ npm run dev                 # web on http://localhost:5173, API on :3001 (proxie
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
-- [Deployment (VPS)](docs/DEPLOYMENT.md)
+- [Deployment (VPS)](docs/DEPLOYMENT.md): one-command setup with `deploy/setup-vps.sh`
 - [CRM integration](docs/CRM_INTEGRATION.md)
 - [Content and imagery guide](docs/CONTENT_GUIDE.md)

@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Velluto Interiors — one-command VPS setup (Ubuntu 22.04 / 24.04)
+#
+# Installs Node.js, PostgreSQL, Nginx and HTTPS, deploys the site from GitHub
+# and runs it as a systemd service. Safe to re-run: running it again pulls the
+# latest code, rebuilds and restarts (existing .env and database are kept).
+#
+# Usage (as root, or with sudo):
+#   sudo bash setup-vps.sh --domain example.com --email you@example.com
+#
+# Options:
+#   --domain   Your domain (without www). Required.
+#   --email    Email for Let's Encrypt certificate expiry notices. Required for HTTPS.
+#   --branch   Git branch to deploy (default: main)
+#   --no-www   Don't configure www.<domain>
+#   --skip-ssl Skip HTTPS (e.g. DNS not pointed yet). Re-run later without it.
+# -----------------------------------------------------------------------------
+set -euo pipefail
+
+REPO_URL="https://github.com/WSEU790/VellutoIinteriors.git"
+APP_USER="velluto"
+BASE_DIR="/srv/velluto"
+APP_DIR="$BASE_DIR/app"
+STORAGE_DIR="$BASE_DIR/storage"
+DB_NAME="velluto"
+DB_USER="velluto"
+PORT=3001
+BRANCH="main"
+DOMAIN=""
+EMAIL=""
+WITH_WWW=1
+SKIP_SSL=0
+
+log()  { printf '\n\033[1;33m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;31m[!] %s\033[0m\n' "$*"; }
+die()  { warn "$*"; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --domain) DOMAIN="${2:-}"; shift 2 ;;
+    --email) EMAIL="${2:-}"; shift 2 ;;
+    --branch) BRANCH="${2:-}"; shift 2 ;;
+    --no-www) WITH_WWW=0; shift ;;
+    --skip-ssl) SKIP_SSL=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) die "Unknown option: $1 (see --help)" ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || die "Please run as root: sudo bash $0 --domain example.com --email you@example.com"
+[[ -n "$DOMAIN" ]] || die "--domain is required"
+DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"; DOMAIN="${DOMAIN%%/*}"; DOMAIN="${DOMAIN#www.}"
+[[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "That doesn't look like a domain: $DOMAIN"
+if [[ $SKIP_SSL -eq 0 && -z "$EMAIL" ]]; then die "--email is required for HTTPS (or pass --skip-ssl)"; fi
+
+. /etc/os-release
+[[ "${ID:-}" == "ubuntu" ]] || warn "This script is written for Ubuntu; detected ${PRETTY_NAME:-unknown}. Continuing anyway."
+
+SERVER_NAMES="$DOMAIN"
+[[ $WITH_WWW -eq 1 ]] && SERVER_NAMES="$DOMAIN www.$DOMAIN"
+
+as_app() { sudo -u "$APP_USER" -H bash -c "$1"; }
+
+# --- 1. System packages ------------------------------------------------------
+log "Installing system packages"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q ca-certificates curl git openssl nginx postgresql ufw certbot python3-certbot-nginx unattended-upgrades
+
+NODE_MAJOR=0
+command -v node >/dev/null && NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+if (( NODE_MAJOR < 20 )); then
+  log "Installing Node.js 22 LTS"
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get install -y -q nodejs
+fi
+log "Node $(node -v), npm $(npm -v)"
+
+# --- 2. App user and code ----------------------------------------------------
+log "Preparing application user and directories"
+id "$APP_USER" &>/dev/null || useradd --system --create-home --home-dir "$BASE_DIR" --shell /bin/bash "$APP_USER"
+install -d -o "$APP_USER" -g "$APP_USER" -m 750 "$BASE_DIR" "$STORAGE_DIR"
+
+if [[ -d "$APP_DIR/.git" ]]; then
+  log "Updating code ($BRANCH)"
+  as_app "cd '$APP_DIR' && git fetch --quiet origin '$BRANCH' && git checkout --quiet '$BRANCH' && git reset --quiet --hard 'origin/$BRANCH'"
+else
+  log "Cloning $REPO_URL ($BRANCH)"
+  as_app "git clone --quiet --branch '$BRANCH' '$REPO_URL' '$APP_DIR'"
+fi
+
+# --- 3. PostgreSQL -----------------------------------------------------------
+log "Configuring PostgreSQL"
+systemctl enable --now postgresql
+ENV_FILE="$APP_DIR/.env"
+DB_URL=""
+if [[ -f "$ENV_FILE" ]]; then
+  DB_URL="$(grep -E '^DATABASE_URL=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
+fi
+psql_admin() { sudo -u postgres psql -v ON_ERROR_STOP=1 -qtAX "$@"; }
+if [[ -z "$DB_URL" ]]; then
+  DB_PASS="$(openssl rand -hex 24)"
+  if [[ "$(psql_admin -c "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'")" == "1" ]]; then
+    psql_admin -c "ALTER ROLE $DB_USER WITH LOGIN PASSWORD '$DB_PASS'"
+  else
+    psql_admin -c "CREATE ROLE $DB_USER WITH LOGIN PASSWORD '$DB_PASS'"
+  fi
+  DB_URL="postgres://$DB_USER:$DB_PASS@127.0.0.1:5432/$DB_NAME"
+fi
+if [[ "$(psql_admin -c "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")" != "1" ]]; then
+  sudo -u postgres createdb -O "$DB_USER" "$DB_NAME"
+fi
+log "Applying database schema"
+PGOPTIONS="-c client_min_messages=warning" psql "$DB_URL" -v ON_ERROR_STOP=1 -q -f "$APP_DIR/db/schema.sql"
+
+# --- 4. Environment file -----------------------------------------------------
+if [[ ! -f "$ENV_FILE" ]]; then
+  log "Creating $ENV_FILE"
+  cat > "$ENV_FILE" <<EOF
+# Generated by deploy/setup-vps.sh on $(date -u +%Y-%m-%d). Edit, then re-run the script to rebuild.
+NODE_ENV=production
+PORT=$PORT
+SITE_URL=https://$DOMAIN
+VITE_SITE_URL=https://$DOMAIN
+
+# Public contact details (shown on the site only when filled in)
+VITE_PUBLIC_PHONE=
+VITE_PUBLIC_EMAIL=
+VITE_PUBLIC_INSTAGRAM_URL=
+
+CORS_ORIGINS=
+LEAD_STORAGE=postgres
+DATABASE_URL=$DB_URL
+STORAGE_DIR=$STORAGE_DIR
+UPLOAD_MAX_FILES=6
+UPLOAD_MAX_MB=10
+
+LEAD_WEBHOOK_URL=
+LEAD_WEBHOOK_SECRET=
+ADMIN_API_TOKEN=$(openssl rand -hex 32)
+
+STATIC_DIR=$APP_DIR/dist
+TRUST_PROXY=loopback
+EOF
+else
+  log "Keeping existing $ENV_FILE"
+fi
+chown "$APP_USER:$APP_USER" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
+# --- 5. Build ----------------------------------------------------------------
+log "Installing dependencies and building (this can take a few minutes)"
+as_app "cd '$APP_DIR' && npm ci --no-audit --no-fund && npm run build"
+
+# --- 6. systemd service ------------------------------------------------------
+log "Installing systemd service"
+cat > /etc/systemd/system/velluto.service <<EOF
+[Unit]
+Description=Velluto Interiors website and API
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=$APP_USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$ENV_FILE
+ExecStart=$(command -v node) server/dist/index.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable velluto >/dev/null
+systemctl restart velluto
+
+# --- 7. Nginx ----------------------------------------------------------------
+log "Configuring Nginx for: $SERVER_NAMES"
+NGINX_SITE=/etc/nginx/sites-available/velluto
+if [[ -f "$NGINX_SITE" ]] && grep -q "managed by Certbot" "$NGINX_SITE"; then
+  log "Existing HTTPS Nginx config found; leaving it in place"
+else
+  cat > "$NGINX_SITE" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $SERVER_NAMES;
+
+    client_max_body_size 70m;
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml application/xml;
+
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 60s;
+    }
+}
+EOF
+fi
+ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/velluto
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+systemctl reload nginx
+
+# --- 8. Firewall -------------------------------------------------------------
+log "Configuring firewall (SSH + HTTP/HTTPS)"
+SSH_PORTS="$(ss -tlnpH 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}' | sort -u)"
+[[ -n "$SSH_PORTS" ]] || SSH_PORTS=22
+for p in $SSH_PORTS; do ufw allow "$p/tcp" >/dev/null; done
+ufw allow 'Nginx Full' >/dev/null
+ufw --force enable >/dev/null
+log "Firewall allows SSH on: $SSH_PORTS, plus ports 80/443"
+
+# --- 9. HTTPS ----------------------------------------------------------------
+if [[ $SKIP_SSL -eq 1 ]]; then
+  warn "Skipping HTTPS (--skip-ssl). Re-run without it once DNS points here."
+else
+  log "Checking DNS before requesting a certificate"
+  MY_IPS=" $(hostname -I) $(curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null || true) "
+  CERT_DOMAINS=()
+  for d in $SERVER_NAMES; do
+    IP="$(getent ahostsv4 "$d" | awk 'NR==1{print $1}')"
+    if [[ -n "$IP" && "$MY_IPS" == *" $IP "* ]]; then
+      CERT_DOMAINS+=(-d "$d")
+    else
+      warn "$d does not resolve to this server yet (resolves to: ${IP:-nothing})."
+    fi
+  done
+  if [[ ${#CERT_DOMAINS[@]} -gt 0 ]]; then
+    certbot --nginx --non-interactive --agree-tos --redirect -m "$EMAIL" --expand "${CERT_DOMAINS[@]}"
+  else
+    warn "No domain points here yet, so HTTPS was skipped. Fix DNS, wait a few minutes, then re-run this script."
+  fi
+fi
+
+# --- 10. Health check --------------------------------------------------------
+log "Checking the app"
+for _ in {1..15}; do
+  curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
+  sleep 1
+done
+if curl -fsS "http://127.0.0.1:$PORT/api/health"; then
+  echo
+  log "Done! Velluto Interiors is running."
+  echo "  Site:          https://$DOMAIN  (http:// until HTTPS is issued)"
+  echo "  Config:        $ENV_FILE   (re-run this script after editing)"
+  echo "  Admin token:   sudo grep ADMIN_API_TOKEN $ENV_FILE"
+  echo "  Logs:          journalctl -u velluto -f"
+  echo "  Update later:  sudo bash $APP_DIR/deploy/setup-vps.sh --domain $DOMAIN --email ${EMAIL:-you@example.com}"
+else
+  warn "The app did not respond. Check: journalctl -u velluto -n 50 --no-pager"
+  exit 1
+fi

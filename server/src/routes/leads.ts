@@ -30,6 +30,8 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function leadsRouter(repo: LeadRepository, notifiers: LeadNotifier[]) {
   const router = Router();
 
@@ -127,6 +129,8 @@ export function leadsRouter(repo: LeadRepository, notifiers: LeadNotifier[]) {
       next(err);
     }
   });
+
+  router.param('id', (_req, res, next, id: string) => (UUID_RE.test(id) ? next() : res.status(404).json({ error: 'Lead not found' })));
 
   // ---- Admin / CRM endpoints (disabled unless ADMIN_API_TOKEN is set) ----
   router.get('/', requireAdmin, async (req, res, next) => {
